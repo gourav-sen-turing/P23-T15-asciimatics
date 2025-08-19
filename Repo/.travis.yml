@@ -1,0 +1,61 @@
+---
+
+sudo: false
+
+language: python
+
+env:
+  global:
+    COVERALLS_PARALLEL=true
+
+matrix:
+  fast_finish: true
+  include:
+    - env: BUILD=test FORCE_TTY=Y
+      python: '2.7'
+    - env: BUILD=test FORCE_TTY=Y
+      python: '3.5'
+    - env: BUILD=test FORCE_TTY=Y
+      python: '3.6'
+    - env: BUILD=test FORCE_TTY=Y
+      python: '3.7'
+      dist: xenial
+      sudo: true
+    - env: BUILD=test FORCE_TTY=Y
+      python: 'pypy'
+
+    - env: BUILD=docs
+      python: '3.6'
+
+install:
+  - pip install -r requirements/dev.txt
+
+script:
+  - |
+    set -ex
+    case "$BUILD" in
+      test)
+        nosetests --with-coverage --cover-package=asciimatics
+        ;;
+      docs)
+        cd doc && cp source/conf_orig.py source/conf.py && ./build.sh
+        ;;
+    esac
+    set +ex
+
+after_success:
+  - |
+    set -ex
+    case "$BUILD" in
+      test)
+        mv .coverage .coverage.travis
+        appveyor-artifacts download
+        python coverage_fix.py */.coverage
+        coverage combine .coverage.travis */.coverage
+        coveralls
+        ;;
+    esac
+    set +ex
+
+notifications:
+  webhooks: https://coveralls.io/webhook
