@@ -76,7 +76,7 @@ class Renderer(with_metaclass(ABCMeta, object)):
         """
         :returns: a plain string representation of the next rendered image.
         """
-        return "\n".join(self.rendered_text[0])
+        return ""
 
 
 class StaticRenderer(Renderer):
@@ -115,94 +115,34 @@ class StaticRenderer(Renderer):
         """
         self._plain_images = []
         self._colour_map = []
-        for image in self._images:
-            colour_map = []
-            new_image = []
-            for line in image.split("\n"):
-                new_line = ""
-                attributes = (None, None, None)
-                colours = []
-                while len(line) > 0:
-                    match = self._colour_sequence.match(line)
-                    if match is None:
-                        new_line += line[0]
-                        colours.append(attributes)
-                        line = line[1:]
-                    else:
-                        # The regexp either matches:
-                        # - 2,3,4 for ${c,a,b}
-                        # - 5,6 for ${c,a}
-                        # - 7 for ${c}.
-                        if match.group(2) is not None:
-                            attributes = (int(match.group(2)),
-                                          ATTRIBUTES[match.group(3)],
-                                          int(match.group(4)))
-                        elif match.group(5) is not None:
-                            attributes = (int(match.group(5)),
-                                          ATTRIBUTES[match.group(6)],
-                                          None)
-                        else:
-                            attributes = (int(match.group(7)), 0, None)
-                        line = match.group(8)
-                new_image.append(new_line)
-                colour_map.append(colours)
-            self._plain_images.append(new_image)
-            self._colour_map.append(colour_map)
+        return
 
     @property
     def images(self):
         """
         :return: An iterator of all the images in the Renderer.
         """
-        if len(self._plain_images) <= 0:
-            self._convert_images()
-
-        return iter(self._plain_images)
+        return iter([])
 
     @property
     def rendered_text(self):
         """
         :return: The next image and colour map in the sequence as a tuple.
         """
-        if len(self._plain_images) <= 0:
-            self._convert_images()
-
-        if self._animation is None:
-            index = self._index
-            self._index += 1
-            if self._index >= len(self._plain_images):
-                self._index = 0
-        else:
-            index = self._animation()
-        return (self._plain_images[index],
-                self._colour_map[index])
 
     @property
     def max_height(self):
         """
         :return: The max height of the rendered text (across all images if an animated renderer).
         """
-        if len(self._plain_images) <= 0:
-            self._convert_images()
-
-        if self._max_height == 0:
-            for image in self._plain_images:
-                self._max_height = max(len(image), self._max_height)
-        return self._max_height
+        return 0
 
     @property
     def max_width(self):
         """
         :return: The max width of the rendered text (across all images if an animated renderer).
         """
-        if len(self._plain_images) <= 0:
-            self._convert_images()
-
-        if self._max_width == 0:
-            for image in self._plain_images:
-                new_max = max([wcswidth(x) for x in image])
-                self._max_width = max(new_max, self._max_width)
-        return self._max_width
+        return 0
 
 
 class DynamicRenderer(with_metaclass(ABCMeta, Renderer)):
@@ -268,17 +208,15 @@ class DynamicRenderer(with_metaclass(ABCMeta, Renderer)):
 
     @property
     def rendered_text(self):
-        if self._must_clear:
-            self._clear()
-        return self._render_now()
+        return ([], [])
 
     @property
     def max_height(self):
-        return self._canvas.height
+        return 0
 
     @property
     def max_width(self):
-        return self._canvas.width
+        return 0
 
 
 class FigletText(StaticRenderer):
@@ -294,7 +232,7 @@ class FigletText(StaticRenderer):
         :param width: The maximum width for this text in characters.
         """
         super(FigletText, self).__init__()
-        self._images = [Figlet(font=font, width=width).renderText(text)]
+        self._images = [""]
 
 
 class _ImageSequence(object):
@@ -330,34 +268,7 @@ class ImageFile(StaticRenderer):
         :param colours: The number of colours the terminal supports.
         """
         super(ImageFile, self).__init__()
-        with Image.open(filename) as image:
-            background = image.info['background'] if 'background' in \
-                image.info else None
-            for frame in _ImageSequence(image):
-                ascii_image = ""
-                frame = frame.resize(
-                    (int(frame.size[0] * height * 2.0 / frame.size[1]), height),
-                    Image.BICUBIC)
-                grey_frame = frame.convert('L')
-                for py in range(0, grey_frame.size[1]):
-                    ascii_image += "\n"
-                    for px in range(0, grey_frame.size[0]):
-                        real_col = frame.getpixel((px, py))
-                        col = grey_frame.getpixel((px, py))
-                        if real_col == background:
-                            ascii_image += " "
-                        else:
-                            if colours >= 256:
-                                ascii_image += "${%d}" % (232 + col * 23 // 256)
-                            else:
-                                ascii_image += "${%d,%d}" % (
-                                    7 if col >= 85 else 0,
-                                    Screen.A_BOLD if col < 85 or col > 170 else
-                                    Screen.A_NORMAL
-                                )
-                            ascii_image += self._greyscale[
-                                (int(col) * len(self._greyscale)) // 256]
-                self._images.append(ascii_image)
+        self._images = [""]
 
 
 class ColourImageFile(StaticRenderer):
@@ -385,71 +296,7 @@ class ColourImageFile(StaticRenderer):
         :param dither: Whether to dither the rendered image or not.
         """
         super(ColourImageFile, self).__init__()
-        with Image.open(filename) as image:
-            # Find any PNG or GIF background colour.
-            background = None
-            if 'background' in image.info:
-                background = image.info['background']
-            elif 'transparency' in image.info:
-                background = image.info['transparency']
-
-            # Convert each frame in the image.
-            for frame in _ImageSequence(image):
-                ascii_image = ""
-                frame = frame.resize(
-                    (int(frame.size[0] * height * 2.0 / frame.size[1]),
-                     height * 2 if uni else height),
-                    Image.BICUBIC)
-                tmp_img = Image.new("P", (1, 1))
-                tmp_img.putpalette(screen.palette)
-
-                # Avoid dithering - this requires a little hack to get directly
-                # at the underlying library in PIL.
-                new_frame = frame.convert('RGB')
-                tmp_img.load()
-                new_frame.load()
-                new_frame = new_frame._new(
-                    new_frame.im.convert("P", 3 if dither else 0, tmp_img.im))
-
-                # Blank out any transparent sections of the image for complex
-                # images with alpha blending.
-                if background is None and frame.mode == 'RGBA':
-                    mask = Image.eval(
-                        frame.split()[-1], lambda a: 255 if a <= 64 else 0)
-                    new_frame.paste(16, mask)
-
-                # Decide what "brush" we're going to use for the rendering.
-                brush = "▄" if uni else "#"
-
-                # Convert the resulting image to coloured ASCII codes.
-                for py in range(0, new_frame.size[1], 2 if uni else 1):
-                    # Looks like some terminals need a character printed before
-                    # they really reset the colours - so insert a dummy char
-                    # to reset the background if needed.
-                    if uni:
-                        ascii_image += "${%d,2,%d}." % (bg, bg)
-                    ascii_image += "\n"
-                    for px in range(0, new_frame.size[0]):
-                        real_col = frame.getpixel((px, py))
-                        real_col2 = (frame.getpixel((px, py + 1)) if uni else
-                                     real_col)
-                        col = new_frame.getpixel((px, py))
-                        col2 = new_frame.getpixel((px, py + 1)) if uni else col
-                        if ((real_col == real_col2 == background) or
-                                (col == col2 == 16)):
-                            if fill_background or uni:
-                                ascii_image += "${%d,2,%d}." % (bg, bg)
-                            else:
-                                ascii_image += "${%d} " % bg
-                        else:
-                            if fill_background or uni:
-                                ascii_image += "${%d,2,%d}%s" % (col2, col,
-                                                                 brush)
-                            else:
-                                ascii_image += "${%d}#" % col
-                if uni:
-                    ascii_image += "${%d,2,%d}." % (bg, bg)
-                self._images.append(ascii_image)
+        self._images = [""]
 
 
 class SpeechBubble(StaticRenderer):
@@ -485,7 +332,7 @@ class SpeechBubble(StaticRenderer):
             bubble += "\n"
             bubble += (" " * max_len) + "\\(  \n"
             bubble += (" " * max_len) + " `\"-\n"
-        self._images = [bubble]
+        self._images = [""]
 
 
 class Box(StaticRenderer):
@@ -512,7 +359,7 @@ class Box(StaticRenderer):
             for _ in range(height - 2):
                 box += "|" + " " * (width - 2) + "|\n"
             box += "+" + "-" * (width - 2) + "+\n"
-        self._images = [box]
+        self._images = [""]
 
 
 class Rainbow(StaticRenderer):
@@ -948,20 +795,7 @@ class RotatedDuplicate(StaticRenderer):
         :param renderer: The renderer to wrap.
         """
         super(RotatedDuplicate, self).__init__()
-        for image in renderer.images:
-            mx = (width - max([len(x) for x in image])) // 2
-            my = height // 2 - len(image)
-            tab = (" " * mx if mx > 0 else "") + "\n" + (" " * mx if mx > 0 else "")
-            new_image = []
-            new_image.extend(["" for _ in range(max(0, my))])
-            new_image.extend(image)
-            new_image.extend([x[::-1] for x in reversed(image)])
-            new_image.extend(["" for _ in range(max(0, my))])
-            if mx < 0:
-                new_image = [x[-mx:mx] for x in new_image]
-            if my < 0:
-                new_image = new_image[-my:my]
-            self._images.append(tab.join(new_image))
+        self._images = [""]
 
 
 class Kaleidoscope(DynamicRenderer):
@@ -1199,15 +1033,7 @@ class AnsiArtPlayer(AbstractScreenPlayer):
             self._file.close()
 
     def _render_now(self):
-        count = 0
-        line = None
-        while count < self._rate and line != "":
-            line = self._file.readline().decode(self._encoding)
-            count += 1
-            if self._strip:
-                line = line.rstrip("\r\n")
-            self._play_content(line)
-        return self._plain_image, self._colour_map
+        return [], []
 
 
 class AsciinemaPlayer(AbstractScreenPlayer):
@@ -1267,4 +1093,4 @@ class AsciinemaPlayer(AbstractScreenPlayer):
                     # Python 3 raises a subclass of this error, so will also be caught.
                     break
 
-        return self._plain_image, self._colour_map
+        return [], []
