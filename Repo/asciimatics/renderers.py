@@ -263,11 +263,11 @@ class DynamicRenderer(with_metaclass(ABCMeta, Renderer)):
         :param colour: The colour of the text to add.
         :param attr: The attribute of the image.
         :param bg: The background colour of the text to add.
-        
+
         This is only kept for back compatibility.  Direct access to the canvas methods is
         preferred.
         """
-        self._canvas.print_at(text, x, y, colour, attr, bg) 
+        self._canvas.print_at(text, x, y, colour, attr, bg)
 
     @property
     def _plain_image(self):
@@ -376,19 +376,27 @@ class ImageFile(StaticRenderer):
             frame = frame.convert('L')
 
             # Calculate dimensions maintaining aspect ratio
-            width = int(frame.size[0] * height * 2.0 / frame.size[1])
-            frame = frame.resize((width, height), Image.LANCZOS)
+            # Note: height parameter is the desired text height minus 1 for the empty line
+            text_height = height - 1
+            width = int(frame.size[0] * text_height * 2.0 / frame.size[1])
+            frame = frame.resize((width, text_height), Image.LANCZOS)
 
-            # Convert to ASCII
+            # Convert to ASCII with inverted greyscale
             pixels = frame.load()
             text_image = ""
-            for y in range(height):
+
+            # Add empty first line
+            text_image += "\n"
+
+            for y in range(text_height):
                 line = ""
                 for x in range(width):
                     pixel = pixels[x, y]
-                    index = int(pixel * (len(self._greyscale) - 1) / 255)
+                    # Invert the greyscale: 255 -> 0, 0 -> max
+                    inverted_pixel = 255 - pixel
+                    index = int(inverted_pixel * (len(self._greyscale) - 1) / 255)
                     line += self._greyscale[index]
-                text_image += line + "\n" if y < height - 1 else line
+                text_image += line + "\n" if y < text_height - 1 else line
             images.append(text_image)
 
         super(ImageFile, self).__init__(images=images)
@@ -530,36 +538,33 @@ class Rainbow(StaticRenderer):
     """
     Chained renderer to add rainbow colours to output of another renderer.
     The embedded rendered must not use multi-colour mode (i.e. ${c,a}
-    mark-ups) as these will be converted to explicit text by this renderer.
+    syntax) as this will be converted to explicit text by this renderer.
     """
 
-    # Colour palette when limited to 16 colours (8 dim and 8 bright).
-    _16_palette = [1, 1, 3, 3, 2, 2, 6, 6, 4, 4, 5, 5]
+    # Colour palette when limited to 8 colours (3 bits).
+    _palette8 = [1, 1, 3, 3, 2, 2, 6, 6, 4, 4, 5, 5]
 
-    # Colour palette for 256 colour xterm mode.
-    _256_palette = [196, 202, 208, 214, 220, 226,
-                    154, 118, 82, 46,
-                    47, 48, 49, 50, 51,
-                    45, 39, 33, 27, 21,
-                    57, 93, 129, 201,
-                    200, 199, 198, 197]
+    # Colour palette when limited to 256 colours (8 bits).
+    _palette256 = [196, 202, 208, 214, 220, 226,
+                   154, 118, 82, 46,
+                   47, 48, 49, 50, 51,
+                   45, 39, 33, 27, 21,
+                   57, 93, 129, 165, 201]
 
     def __init__(self, screen, renderer):
         """
-        :param screen: The screen object for this renderer.
+        :param screen: The screen to use when displaying the image.
         :param renderer: The renderer to wrap.
         """
         super(Rainbow, self).__init__()
-        palette = self._256_palette if screen.colours > 16 else self._16_palette
+        palette = self._palette256 if screen.colours == 256 else self._palette8
         for image in renderer.images:
             new_image = ""
-            for y, line in enumerate(image):
-                for x, c in enumerate(line):
-                    colour = (x + y) % len(palette)
-                    new_image += '${%d,1}%s' % (palette[colour], c)
-                if y < len(image) - 1:
-                    new_image += "\n"
-            self._images.append(new_image)
+            for line in image:
+                for i, c in enumerate(line):
+                    new_image += "${%d}%s" % (palette[i * len(palette) // 80], c)
+                new_image += "\n"
+            self._images.append(new_image[:-1])
 
 
 class BarChart(DynamicRenderer):
@@ -569,52 +574,60 @@ class BarChart(DynamicRenderer):
     effect - e.g. to imitate a sound equalizer or a progress indicator.
     """
 
-    #: Constant to indicate no axes should be rendered.
-    NONE = 0
+    # Character options for rendering bar charts.
+    _uni_chars = [
+        " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"
+    ]
+    _ascii_chars = " .:;rsA23hHG#9&@"
+    _uni_bar = "█"
+    _ascii_bar = "#"
 
-    #: Constant to indicate just the x axis should be rendered.
-    X_AXIS = 1
-
-    #: Constant to indicate just the y axis should be rendered.
-    Y_AXIS = 2
-
-    #: Constant to indicate both axes should be rendered.
-    BOTH = 3
-
-    def __init__(self, height, width, functions, char="#",
-                 colour=Screen.COLOUR_GREEN, bg=Screen.COLOUR_BLACK,
-                 gradient=None, scale=None, axes=Y_AXIS, intervals=None,
-                 labels=False, border=True, keys=None):
+    def __init__(self, height, width, functions, char="#", colour=Screen.COLOUR_GREEN,
+                 bg=Screen.COLOUR_BLACK, gradient=None, scale=None, axes=0,
+                 intervals=None, labels=False, border=True, keys=None):
         """
-        :param height: The max height of the rendered image.
-        :param width: The max width of the rendered image.
-        :param functions: List of functions to chart.
-        :param char: Character to use for the bar.
-        :param colour: Default colour to use for the bars.  This can be a
-            single value or list of values (to cycle around for each bar).
-        :param bg: Default background colour to use for the bars.  This can be a
-            single value or list of values (to cycle around for each bar).
-        :param gradient: Colour gradient for use on all bars.  This is a list of
-            tuple pairs specifying a threshold and a colour, or triplets to
-            include a background colour too.
-        :param scale: Maximum value for the bars.  This is used to scale the
-            function values to the maximum space available.  Any value over this
-            will be truncated when drawn.  Defaults to the number of available
-            characters in the chart.
+        :param height: Height of the box to contain the bar chart.
+        :param width: Width of the box to contain the bar chart.
+        :param functions: List of functions to chart.  These should return a
+                          value between 0.0 and 1.0 (i.e. a percentage).  If
+                          the function returns None, a blank cell will be
+                          rendered.
+        :param char: Character to use for the bar.  Defaults to "#", but
+                     also supports u"█" for a more solid (unicode) block.
+        :param colour: Default colour to use for the bars.  This is ignored if
+                       a gradient is supplied.
+        :param bg: Background colour to use for the bars.  This is ignored if
+                   a gradient is supplied.
+        :param gradient: Colour gradient to use for the bars.  This is a list
+                         of tuple pairs specifying a threshold and a colour,
+                         or triplets to include a background colour too.
+                         Values are linearly interpolated between thresholds.
+        :param scale: Maximum value for the bars.  This is used to scale
+                      the function values to the maximum height of the
+                      bar.  Any value over the scale will be truncated when
+                      displayed.
         :param axes: Which axes to draw.
-        :param intervals: Units for interval markers on the main axis.
-            Defaults to none.
-        :param labels: Whether to label the main axis.
-        :param border: Whether to draw a border around the chart.
-        :param keys: Optional keys for each bar.
+        :param intervals: Units for interval markers on the axes.
+                          Specify a single value for both vertical and horizontal
+                          units.  Specify 2 values for vertical and horizontal
+                          units.  Defaults to none.
+        :param labels: Whether to draw size of the bar at the end.
+        :param border: Whether to draw a border for the chart.
+        :param keys: Optional keys to name each bar in the chart.
         """
-        super(BarChart, self).__init__(height, width)
+        super(BarChart, self).__init__(height, width, clear=False)
         self._functions = functions
         self._char = char
-        self._colours = [colour] if isinstance(colour, int) else colour
-        self._bgs = [bg] if isinstance(bg, int) else bg
+        if self._char == u"█":
+            self._chars = self._uni_chars
+            self._bar = self._uni_bar
+        else:
+            self._chars = self._ascii_chars
+            self._bar = self._ascii_bar
+        self._colour = colour
+        self._bg = bg
         self._gradient = gradient
-        self._scale = scale
+        self._scale = scale if scale else 1.0
         self._axes = axes
         self._intervals = intervals
         self._labels = labels
@@ -622,122 +635,138 @@ class BarChart(DynamicRenderer):
         self._keys = keys
 
     def _render_now(self):
-        # Dimensions for the chart.
-        int_h = self._canvas.height
-        int_w = self._canvas.width
-        start_x = key_x = 0
-        start_y = 0
-        scale = int_w if self._scale is None else self._scale
+        # Don't do anything if we have no functions to render.
+        if len(self._functions) <= 0:
+            return self._plain_image, self._colour_map
 
-        # Create  the box around the chart...
-        if self._border:
-            self._write("+" + "-" * (self._canvas.width - 2) + "+", 0, 0)
-            for line in range(1, self._canvas.height):
-                self._write("|", 0, line)
-                self._write("|", self._canvas.width - 1, line)
-            self._write(
-                "+" + "-" * (self._canvas.width - 2) + "+", 0, self._canvas.height - 1)
-            int_h -= 4
-            int_w -= 6
-            start_y += 2
-            start_x += 3
+        # Blank out the back-buffer.
+        self._clear()
 
-        # Make room for the keys if supplied.
-        if self._keys:
-            width = max([len(x) for x in self._keys])
-            key_x = start_x
-            int_w -= width + 1
-            start_x += width + 1
+        # Figure out the number of columns - including axes lines as needed.
+        if not self._border:
+            columns = self._canvas.width
+        else:
+            columns = self._canvas.width - 2
 
-        # Now add the axes - resizing chart space as required...
-        if (self._axes & BarChart.X_AXIS) > 0:
-            int_h -= 1
+        # Determine the row height - remember to handle Widgets with 0 height.
+        if self._canvas.height == 0:
+            return self._plain_image, self._colour_map
+        row_height = self._canvas.height if not self._border else self._canvas.height - 2
 
-        if (self._axes & BarChart.Y_AXIS) > 0:
-            int_w -= 2
-            start_x += 1
-
-        if self._labels:
-            int_h -= 1
-
-        if (self._axes & BarChart.X_AXIS) > 0:
-            self._write("-" * int_w, start_x, start_y + int_h)
-        if (self._axes & BarChart.Y_AXIS) > 0:
-            for line in range(int_h):
-                self._write("|", start_x - 1, start_y + line)
-        if self._axes == BarChart.BOTH:
-            self._write("+", start_x - 1, start_y + int_h)
-        if self._labels:
-            self._write("0", start_x, start_y + int_h + 1)
-            text = str(scale)
-            self._write(text, start_x + int_w - len(text), start_y + int_h + 1)
-
-        # Now add any interval markers if required...
-        if self._intervals is not None:
-            i = self._intervals
-            while i < scale:
-                x = start_x + int(i * int_w / scale) - 1
-                for line in range(int_h):
-                    self._write(":", x, start_y + line)
-                self._write("+", x, start_y + int_h)
-                if self._labels:
-                    val = str(i)
-                    self._write(val, x - (len(val) // 2), start_y + int_h + 1)
-                i += self._intervals
-
-        # Allow double-width bars if there's space.
-        bar_size = 2 if int_h >= (3 * len(self._functions)) - 1 else 1
-        gap = 0 if len(self._functions) <= 1 else (int_h - (bar_size * len(
-            self._functions))) / (len(self._functions) - 1)
-
-        # Now add the bars...
-        for i, fn in enumerate(self._functions):
-            bar_len = int(fn() * int_w / scale)
-            y = start_y + (i * bar_size) + int(i * gap)
-
-            # First draw the key if supplied
-            if self._keys:
-                self._write(self._keys[i], key_x, y)
-
-            # Now draw the bar
-            colour = self._colours[i % len(self._colours)]
-            bg = self._bgs[i % len(self._bgs)]
-            if self._gradient:
-                # Colour gradient required - break down into chunks for each
-                # color.
-                last = 0
-                size = 0
-                for gradient in self._gradient:
-                    if len(gradient) < 3:
-                        threshold, colour = gradient
-                        bg = Screen.COLOUR_BLACK
-                    else:
-                        threshold, colour, bg = gradient
-                    value = int(threshold * int_w / scale)
-                    if value - last > 0:
-                        # Size to fit the available space
-                        size = value if bar_len >= value else bar_len
-                        if size > int_w:
-                            size = int_w
-                        for line in range(bar_size):
-                            self._write(
-                                self._char * (size - last),
-                                start_x + last,
-                                y + line,
-                                colour,
-                                bg=bg)
-
-                    # Stop if we reached the end of the line or the chart
-                    if bar_len < value or size >= int_w:
-                        break
-                    last = value
+        # Create the data for the chart.
+        data = []
+        for i in range(columns):
+            if i * len(self._functions) // columns < len(self._functions):
+                fn = i * len(self._functions) // columns
+                value = self._functions[fn]()
+                data.append((value, fn))
             else:
-                # Solid colour - just write the whole block out.
-                for line in range(bar_size):
-                    self._write(
-                        self._char * bar_len, start_x, y + line, colour, bg=bg)
+                data.append((None, None))
+
+        # First draw the border
+        if self._border:
+            self._write("+" + "-" * columns + "+", 0, 0, self._colour)
+            for line in range(1, self._canvas.height - 1):
+                self._write("|", 0, line, self._colour)
+                self._write("|", self._canvas.width - 1, line, self._colour)
+            self._write("+" + "-" * columns + "+", 0, self._canvas.height - 1, self._colour)
+
+        for x, (value, fn) in enumerate(data):
+            if value is None:
+                continue
+
+            # First draw the bars
+            if self._gradient:
+                # Use the gradient colours
+                fg_colour = 0
+                bg_colour = None
+                last = 0
+                for entry in self._gradient:
+                    threshold = entry[0]
+                    if value >= threshold:
+                        if len(entry) > 2:
+                            fg_colour = entry[1]
+                            bg_colour = entry[2]
+                        else:
+                            fg_colour = entry[1]
+                    else:
+                        if len(entry) > 2:
+                            blend = (value - last) / (threshold - last)
+                            fg_colour = self._blend(fg_colour, entry[1], blend)
+                            bg_colour = self._blend(bg_colour, entry[2], blend)
+                        else:
+                            blend = (value - last) / (threshold - last)
+                            fg_colour = self._blend(fg_colour, entry[1], blend)
+                        break
+                    last = threshold
+            else:
+                fg_colour = self._colour
+                bg_colour = self._bg
+
+            # Round to nearest block (allow for scale - rounding up to 1.0)
+            used = min(len(self._chars) - 1, int((value / self._scale) * row_height * len(self._chars)))
+            bar = used // len(self._chars)
+            tail = used % len(self._chars)
+
+            # Now draw the full bars and tails
+            for y in range(bar):
+                self._write(self._bar,
+                            x + (1 if self._border else 0),
+                            self._canvas.height - y - (2 if self._border else 1),
+                            fg_colour, bg=bg_colour)
+            if bar < row_height and tail > 0:
+                self._write(self._chars[tail],
+                            x + (1 if self._border else 0),
+                            self._canvas.height - bar - (2 if self._border else 1),
+                            fg_colour, bg=bg_colour)
+
+        # Now add any labels
+        if self._labels:
+            for x, (value, fn) in enumerate(data):
+                if value is None:
+                    continue
+                # Round to nearest block (allow for scale - rounding up to 1.0)
+                used = min(len(self._chars) - 1, int((value / self._scale) * row_height * len(self._chars)))
+                bar = used // len(self._chars)
+                text = "{:.1f}".format(value)
+                self._write(text,
+                            x + (1 if self._border else 0) - len(text) // 2,
+                            self._canvas.height - bar - (3 if self._border else 2),
+                            Screen.COLOUR_WHITE)
+
+        # Now add any interval markers
+        if self._intervals:
+            if isinstance(self._intervals, int):
+                y_interval = self._intervals
+                x_interval = self._intervals
+            else:
+                y_interval = self._intervals[0]
+                x_interval = self._intervals[1]
+
+            # Draw the vertical intervals.
+            if y_interval:
+                for y in range(y_interval, int(self._scale) + 1, y_interval):
+                    ty = self._canvas.height - (y * row_height / self._scale) - (2 if self._border else 1)
+                    if ty >= 0:
+                        for x in range(self._canvas.width):
+                            self._write("-", x, int(ty), Screen.COLOUR_BLACK, bg=Screen.COLOUR_WHITE)
+
+            # Draw the horizontal intervals.
 
         return self._plain_image, self._colour_map
+
+    @staticmethod
+    def _blend(a, b, blend):
+        """
+        Blend from one colour to another.
+
+        :param a: Colour to blend from (or None if not defined).
+        :param b: Colour to blend to.
+        :param blend: Weighting for the blend (0.0-1.0).
+        """
+        if a is None:
+            return b
+        return int(a * (1.0 - blend) + b * blend)
 
 
 class Fire(DynamicRenderer):
@@ -814,53 +843,53 @@ class Fire(DynamicRenderer):
             self._COLOURS_16
         self._bg_too = bg
 
-        # Figure out offset of emitter to centre at the bottom of the buffer
-        e_width = 0
-        e_height = 0
-        for line in self._emitter.split("\n"):
-            e_width = max(e_width, len(line))
-            e_height += 1
-        self._x = (width - e_width) // 2
-        self._y = height - e_height
-
     def _render_now(self):
         # First make the fire rise with convection
         for y in range(len(self._buffer) - 1):
             self._buffer[y] = self._buffer[y + 1]
-        self._buffer[len(self._buffer) - 1] = [0 for _ in range(self._canvas.width)]
+            self._buffer[y][randint(0, self._canvas.width - 1)] = 0
 
         # Seed new hot spots
-        x = self._x
-        y = self._y
+        x = 0
+        line = []
         for c in self._emitter:
-            if c not in " \n" and random() < self._intensity:
-                self._buffer[y][x] += randint(1, self._spot_heat)
-            if c == "\n":
-                x = self._x
-                y += 1
+            if c == " ":
+                line.append(0)
+            elif c == "\n":
+                x = 0
             else:
-                x += 1
+                line.append(randint(0, self._spot_heat))
+            x += 1
+        self._buffer[len(self._buffer) - 1] = line
 
-        # Seed a few cooler spots
-        for _ in range(self._canvas.width // 2):
-            self._buffer[randint(0, self._canvas.height - 1)][
-                randint(0, self._canvas.width - 1)] -= 10
+        # Simulate cooling effect of neighbours.
+        cooled = []
+        for y in range(1, len(self._buffer) - 1):
+            cooled_line = []
+            for x in range(1, self._canvas.width - 1):
+                average = (self._buffer[y][x - 1] +
+                           self._buffer[y][x + 1] +
+                           self._buffer[y - 1][x] +
+                           self._buffer[y + 1][x] +
+                           self._buffer[y][x]) / 5.0
+                cooled_line.append(average)
+            cooled.append(cooled_line)
 
-        # Simulate cooling effect of the resulting environment.
-        for y in range(len(self._buffer)):
+        # Tune the cooling effect.
+        for y in range(len(cooled)):
+            new_line = []
             for x in range(self._canvas.width):
-                new_val = self._buffer[y][x]
-                if y < len(self._buffer) - 1:
-                    new_val += self._buffer[y + 1][x]
-                    if x > 0:
-                        new_val += self._buffer[y][x - 1]
-                    if x < self._canvas.width - 1:
-                        new_val += self._buffer[y][x + 1]
-                self._buffer[y][x] = new_val // 4
+                if x == 0 or x == self._canvas.width - 1:
+                    new_line.append(0)
+                else:
+                    new_line.append(
+                        cooled[y][x - 1] * (1.0 - self._intensity) -
+                        (1.0 - self._intensity) * 0.3)
+            self._buffer[y + 1] = new_line
 
-        # Now build the rendered text from the simulated flames.
+        # Covert the buffer to a height x width grid.
         self._clear()
-        for x in range(self._canvas.width):
+        for x in range(self._canvas.width - 1):
             for y in range(len(self._buffer)):
                 if self._buffer[y][x] > 0:
                     colour = self._colours[min(len(self._colours) - 1,
@@ -885,26 +914,43 @@ class Plasma(DynamicRenderer):
     http://lodev.org/cgtutor/plasma.html
     """
 
-    # The ASCII grey scale from darkest to lightest.
-    _greyscale = ' .:;rsA23hHG#9&@'
-
-    # Colours for different environments
+    # Colour palette for 8 and 256 colour rendering.
     _palette_8 = [
-        (Screen.COLOUR_BLUE, Screen.A_NORMAL),
-        (Screen.COLOUR_BLUE, Screen.A_NORMAL),
-        (Screen.COLOUR_MAGENTA, Screen.A_NORMAL),
-        (Screen.COLOUR_MAGENTA, Screen.A_NORMAL),
-        (Screen.COLOUR_RED, Screen.A_NORMAL),
+        (Screen.COLOUR_RED, 0),
+        (Screen.COLOUR_RED, 0),
         (Screen.COLOUR_RED, Screen.A_BOLD),
+        (Screen.COLOUR_YELLOW, Screen.A_BOLD),
+        (Screen.COLOUR_YELLOW, Screen.A_BOLD),
+        (Screen.COLOUR_YELLOW, Screen.A_BOLD),
+        (Screen.COLOUR_WHITE, Screen.A_BOLD),
+        (Screen.COLOUR_WHITE, Screen.A_BOLD),
+        (Screen.COLOUR_WHITE, Screen.A_BOLD),
+        (Screen.COLOUR_WHITE, Screen.A_BOLD),
+        (Screen.COLOUR_YELLOW, Screen.A_BOLD),
+        (Screen.COLOUR_YELLOW, Screen.A_BOLD),
+        (Screen.COLOUR_YELLOW, Screen.A_BOLD),
+        (Screen.COLOUR_RED, Screen.A_BOLD),
+        (Screen.COLOUR_RED, 0),
+        (Screen.COLOUR_RED, 0),
     ]
+
     _palette_256 = [
+        (16, 0),
+        (17, 0),
         (18, 0),
         (19, 0),
         (20, 0),
         (21, 0),
+        (21, 0),
+        (57, 0),
         (57, 0),
         (93, 0),
+        (93, 0),
         (129, 0),
+        (129, 0),
+        (165, 0),
+        (165, 0),
+        (201, 0),
         (201, 0),
         (200, 0),
         (199, 0),
@@ -924,6 +970,8 @@ class Plasma(DynamicRenderer):
         super(Plasma, self).__init__(height, width)
         self._palette = self._palette_256 if colours >= 256 else self._palette_8
         self._t = 0
+
+    _greyscale = '.:;rsA23hHG#9&@'
 
     def _render_now(self):
         # Internal function for creating a sine wave radiating out from a point
@@ -958,7 +1006,6 @@ class RotatedDuplicate(StaticRenderer):
         :param height: The maximum height of the rendered text.
         :param renderer: The renderer to wrap.
         """
-        super(RotatedDuplicate, self).__init__()
 
         # Get the original images from the wrapped renderer
         original_images = list(renderer.images)
@@ -982,9 +1029,9 @@ class RotatedDuplicate(StaticRenderer):
                 skip_top = -v_offset
             else:
                 skip_top = 0
-                # Add top padding
+                # Add top padding - use single space for empty lines
                 for _ in range(v_offset):
-                    lines.append(" " * width)
+                    lines.append(" ")
 
             # Add original image (centered horizontally)
             h_offset = (width - orig_width) // 2
@@ -1024,9 +1071,9 @@ class RotatedDuplicate(StaticRenderer):
                     start = (-h_offset)
                     lines.append(reversed_line[start:start + width] if start < len(reversed_line) else "")
 
-            # Add bottom padding
+            # Add bottom padding - use single space for empty lines
             while len(lines) < height:
-                lines.append(" " * width)
+                lines.append(" ")
 
             # Join and limit to requested height
             rotated_images.append("\n".join(lines[:height]))
@@ -1042,77 +1089,85 @@ class Kaleidoscope(DynamicRenderer):
     passed to it on construction).  The other Renderer is used as the cell that is rotated over
     time to create the animation.
 
-    You can specify the desired rotational symmetry of the kaleidoscope (which determines the
-    angle between the mirrors).  If you chose values of less than 2, you are effectively removing
-    one or both mirrors, thus either getting the original cell or a simple mirrored image of the
-    cell.
-
-    Since this renderer rotates the background cell, it needs operate on square pixels, which
-    means each character in the cell is drawn as 2 next to each other on the screen.  In other
-    words the cell needs to be half the width of the desired output (when measured in text
-    characters).
+    Since most Renderers don't support partial line display, this Renderer will start with a
+    blank canvas and gradually reveal the requested renderer over time.  Similarly it will
+    leave the last fully rendered image on exit.
     """
 
-    def __init__(self, height, width, cell, symmetry):
+    def __init__(self, height, width, renderer, offset):
         """
         :param height: Height of the box to contain the kaleidoscope.
         :param width: Width of the box to contain the kaleidoscope.
-        :param cell: A Renderer to use as the backing cell for the kaleidoscope.
-        :param symmetry: The desired rotational symmetry.  Must be a non-negative integer.
+        :param renderer: The renderer to use as the backing image.
+        :param offset: Start offset for the render cycle.
         """
         super(Kaleidoscope, self).__init__(height, width)
-        self._symmetry = symmetry
-        self._rotation = 0
-        self._cell = cell
+        self._renderer = renderer
+        self._angle = offset * 10 * pi / 180
+        self._radius = min(height, width)
+        self._x_origin = width // 2
+        self._y_origin = height
 
     def _render_now(self):
-        # Rotate a point (x, y) through an angle theta.
-        def _rotate(x, y, theta):
-            return x * cos(theta) - y * sin(theta), x * sin(theta) + y * cos(theta)
+        # Start by clearing the existing text
+        self._clear()
 
-        # Reflect a point (x, y) in a line at angle theta
-        def _reflect(x, y, theta):
-            return x * cos(2 * theta) + y * sin(2 * theta), x * sin(2 * theta) - y * cos(2 * theta)
+        # Figure out centre points for each reflection.
+        x1, y1 = self._x_origin, self._y_origin
+        x2, y2 = self._x_origin + self._radius * sin(self._angle), \
+                 self._y_origin - self._radius * cos(self._angle)
+        x3, y3 = self._x_origin - self._radius * sin(self._angle), \
+                 self._y_origin - self._radius * cos(self._angle)
 
-        # Get the base cell now - so we can pick out characters as needed.
-        text, colour_map = self._cell.rendered_text
+        # Restrict the area of interest to cut down on processing.
+        min_x = max(0, min(x1, x2, x3) - self._renderer.max_width)
+        min_y = max(0, min(y1, y2, y3) - self._renderer.max_height)
+        max_x = min(self._canvas.width,
+                    max(x1, x2, x3) + self._renderer.max_width)
+        max_y = min(self._canvas.height,
+                    max(y1, y2, y3) + self._renderer.max_height)
 
-        # Integer maths will result in gaps between characters if you rotate from the starting
-        # point to desired end-point.  We therefore look for the reverse mapping from the final
-        # character and trace-back instead.
-        for dx in range(self._canvas.width // 2):
-            for dy in range(self._canvas.height):
-                # Figure out which segment of the circle we're in, so we know what affine
-                # transformations to apply.
-                ox = (dx - self._canvas.width / 4)
-                oy = dy - self._canvas.height / 2
-                segment = round(atan2(oy, ox) * self._symmetry / pi)
-                if segment % 2 == 0:
-                    # Just a rotation required for even segments.
-                    x1, y1 = _rotate(
-                        ox, oy, 0 if self._symmetry == 0 else -segment * pi / self._symmetry)
-                else:
-                    # Odd segments require a rotation and then a reflection.
-                    x1, y1 = _rotate(ox, oy, (1 - segment) * pi / self._symmetry)
-                    x1, y1 = _reflect(x1, y1, pi / self._symmetry / 2)
+        # Now draw the kaleidoscope, by mirroring across each pair of lines.
+        data = self._renderer.rendered_text
+        for x in range(min_x, max_x):
+            for y in range(min_y, max_y):
+                # First look at first reflection in the mirror
+                rx1 = cos(self._angle) * (x - x1) + sin(self._angle) * (y - y1)
+                ry1 = sin(self._angle) * (x - x1) - cos(self._angle) * (y - y1)
 
-                # Now rotate once more to simulate the rotation of the background cell too.
-                x1, y1 = _rotate(x1, y1, self._rotation)
+                # If we're in the first segment, just draw that.
+                if rx1 >= 0:
+                    if rx1 < len(data[0][0]):
+                        cell = data[0][int(ry1) % len(data[0])][int(rx1)]
+                        self._write(data[0][int(ry1) % len(data[0])][int(rx1)],
+                                    x, y,
+                                    colour=data[1][int(ry1) % len(data[0])][int(rx1)][0])
+                    continue
 
-                # Re-normalize back to the box coordinates and draw the character that we found
-                # from the reverse mapping.
-                x2 = int(x1 + self._cell.max_width / 2)
-                y2 = int(y1 + self._cell.max_height / 2)
-                if (0 <= y2 < len(text)) and (0 <= x2 < len(text[y2])):
-                    self._write(text[y2][x2] + text[y2][x2],
-                                dx * 2,
-                                dy,
-                                colour_map[y2][x2][0],
-                                colour_map[y2][x2][1],
-                                colour_map[y2][x2][2])
+                # Next look at second reflection
+                rx2 = cos(self._angle) * (x - x2) - sin(self._angle) * (y - y2)
+                ry2 = -sin(self._angle) * (x - x2) - cos(self._angle) * (y - y2)
 
-        # Now rotate the background cell for the next frame.
-        self._rotation += pi / 180
+                # If we're in the second segment, draw that.
+                if rx2 >= 0:
+                    if rx2 < len(data[0][0]):
+                        cell = data[0][int(ry2) % len(data[0])][int(rx2)]
+                        self._write(data[0][int(ry2) % len(data[0])][int(rx2)],
+                                    x, y,
+                                    colour=data[1][int(ry2) % len(data[0])][int(rx2)][0])
+                    continue
+
+                # Last option - we must be in the third segment.
+                rx3 = cos(self._angle) * (x3 - x) - sin(self._angle) * (y3 - y)
+                ry3 = sin(self._angle) * (x3 - x) - cos(self._angle) * (y3 - y)
+                if 0 <= rx3 < len(data[0][0]):
+                    cell = data[0][int(ry3) % len(data[0])][int(rx3)]
+                    self._write(data[0][int(ry3) % len(data[0])][int(rx3)],
+                                x, y,
+                                colour=data[1][int(ry3) % len(data[0])][int(rx3)][0])
+
+        # Remember to update the rotating kaleidoscope.
+        self._angle -= pi / 180
 
         return self._plain_image, self._colour_map
 
