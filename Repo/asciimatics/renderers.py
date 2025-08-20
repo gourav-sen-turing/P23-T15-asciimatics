@@ -115,34 +115,120 @@ class StaticRenderer(Renderer):
         """
         self._plain_images = []
         self._colour_map = []
-        return
+
+        for i in self._images:
+            # Convert to list of lines
+            lines = i.split("\n")
+
+            # Calculate dimensions
+            height = len(lines)
+            width = max(wcswidth(self._colour_sequence.sub("", line), len(line))
+                       for line in lines) if lines else 0
+            self._max_height = max(height, self._max_height)
+            self._max_width = max(width, self._max_width)
+
+            # Parse color codes and create plain text + color map
+            plain_image = []
+            colour_map = []
+
+            for line in lines:
+                plain_line = ""
+                line_colours = []
+                x = 0
+                last_colours = None
+
+                while line:
+                    match = self._colour_sequence.match(line)
+                    if match:
+                        # Found a colour sequence - process it
+                        if last_colours:
+                            # Pad out the line_colours to current position
+                            while len(line_colours) < x:
+                                line_colours.append(last_colours)
+
+                        # Parse color sequence - group(1) has all the parameters
+                        colours = match.group(1).split(",")
+                        if len(colours) == 1:
+                            last_colours = (int(colours[0]), 0, None)
+                        elif len(colours) == 2:
+                            attr = ATTRIBUTES.get(colours[1], int(colours[1]))
+                            last_colours = (int(colours[0]), attr, None)
+                        else:
+                            attr = ATTRIBUTES.get(colours[1], int(colours[1]))
+                            last_colours = (int(colours[0]), attr, int(colours[2]))
+
+                        # Group 8 has the remaining text
+                        line = match.group(8)
+                    else:
+                        # Regular character
+                        char = line[0]
+                        plain_line += char
+                        if last_colours:
+                            line_colours.append(last_colours)
+                        x += wcswidth(char, 1)
+                        line = line[1:]
+
+                plain_image.append(plain_line)
+                colour_map.append(line_colours if line_colours else None)
+
+            self._plain_images.append(plain_image)
+            self._colour_map.append(colour_map)
 
     @property
     def images(self):
         """
         :return: An iterator of all the images in the Renderer.
         """
-        return iter([])
+        if not self._plain_images:
+            self._convert_images()
+        return iter(self._plain_images)
 
     @property
     def rendered_text(self):
         """
         :return: The next image and colour map in the sequence as a tuple.
         """
+        if not self._plain_images:
+            self._convert_images()
+
+        if self._animation:
+            index = self._animation()
+            if index is not None:
+                self._index = index
+
+        image = self._plain_images[self._index % len(self._plain_images)] if self._plain_images else []
+        colours = self._colour_map[self._index % len(self._colour_map)] if self._colour_map else []
+
+        self._index += 1
+        return image, colours
 
     @property
     def max_height(self):
         """
         :return: The max height of the rendered text (across all images if an animated renderer).
         """
-        return 0
+        if not self._plain_images:
+            self._convert_images()
+        return self._max_height
 
     @property
     def max_width(self):
         """
         :return: The max width of the rendered text (across all images if an animated renderer).
         """
-        return 0
+        if not self._plain_images:
+            self._convert_images()
+        return self._max_width
+
+    def __str__(self):
+        """
+        :return: A plain string representation of the next rendered image.
+        """
+        if not self._plain_images:
+            self._convert_images()
+        if self._plain_images:
+            return "\n".join(self._plain_images[0])
+        return ""
 
 
 class DynamicRenderer(with_metaclass(ABCMeta, Renderer)):
@@ -208,15 +294,40 @@ class DynamicRenderer(with_metaclass(ABCMeta, Renderer)):
 
     @property
     def rendered_text(self):
-        return ([], [])
+        self._render_now()
+        return self._plain_image, self._colour_map
 
     @property
     def max_height(self):
-        return 0
+        return self._canvas.height
 
     @property
     def max_width(self):
-        return 0
+        return self._canvas.width
+
+    def __str__(self):
+        """
+        :return: A plain string representation of the current canvas.
+        """
+        self._render_now()
+        result = []
+        for y in range(self._canvas.height):
+            line = ""
+            for x in range(self._canvas.width):
+                char_data = self._canvas.get_from(x, y + self._canvas.start_line)
+                if char_data:
+                    line += chr(char_data[0]) if char_data[0] else " "
+                else:
+                    line += " "
+            # Keep the full width line with trailing spaces
+            result.append(line)
+        # Keep all lines but strip trailing newlines
+        while result and all(c == ' ' for c in result[-1]):
+            result.pop()
+        # But ensure we have at least the full height
+        while len(result) < self._canvas.height:
+            result.append(" " * self._canvas.width)
+        return "\n".join(result)
 
 
 class FigletText(StaticRenderer):
@@ -232,7 +343,8 @@ class FigletText(StaticRenderer):
         :param width: The maximum width for this text in characters.
         """
         super(FigletText, self).__init__()
-        self._images = [""]
+        figlet = Figlet(font=font, width=width)
+        self._images = [figlet.renderText(text)]
 
 
 class _ImageSequence(object):
@@ -268,7 +380,33 @@ class ImageFile(StaticRenderer):
         :param colours: The number of colours the terminal supports.
         """
         super(ImageFile, self).__init__()
-        self._images = [""]
+
+        # Load the image
+        im = Image.open(filename)
+
+        # Process each frame in the image
+        self._images = []
+        for frame in _ImageSequence(im):
+            # Convert to greyscale
+            frame = frame.convert('L')
+
+            # Resize to fit the required height
+            width = int(frame.size[0] * height * 2.0 / frame.size[1])
+            frame = frame.resize((width, height), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
+
+            # Convert to ASCII
+            pixels = frame.load()
+            lines = []
+            for y in range(frame.size[1]):
+                line = ""
+                for x in range(frame.size[0]):
+                    pixel = pixels[x, y]
+                    index = int(pixel * len(self._greyscale) / 256)
+                    if index >= len(self._greyscale):
+                        index = len(self._greyscale) - 1
+                    line += self._greyscale[index]
+                lines.append(line)
+            self._images.append("\n".join(lines))
 
 
 class ColourImageFile(StaticRenderer):
@@ -296,7 +434,48 @@ class ColourImageFile(StaticRenderer):
         :param dither: Whether to dither the rendered image or not.
         """
         super(ColourImageFile, self).__init__()
-        self._images = [""]
+
+        # Load the image
+        im = Image.open(filename)
+
+        # Map each pixel to a unicode block character with the right colour
+        self._images = []
+        for frame in _ImageSequence(im):
+            # Convert to RGB if needed
+            if frame.mode != "RGB":
+                frame = frame.convert("RGB")
+
+            # Resize to fit the required height
+            width = int(frame.size[0] * height * 2.0 / frame.size[1])
+            frame = frame.resize((width // 2, height), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
+
+            # Convert to text with colors
+            pixels = frame.load()
+            line = ""
+            for y in range(frame.size[1]):
+                for x in range(frame.size[0]):
+                    r, g, b = pixels[x, y]
+                    # Convert RGB to xterm-256 color
+                    if screen.colours >= 256:
+                        # Use 6x6x6 colour cube
+                        colour = 16 + (36 * (r * 5 // 255)) + (6 * (g * 5 // 255)) + (b * 5 // 255)
+                    else:
+                        # Use basic 16 colors
+                        colour = ((r > 127) * 1 + (g > 127) * 2 + (b > 127) * 4)
+
+                    if uni:
+                        # Use unicode block character
+                        char = "█"
+                    else:
+                        # Use space with background color
+                        char = " "
+
+                    if fill_background:
+                        line += "${%d,0,%d}%s" % (colour, colour, char)
+                    else:
+                        line += "${%d}%s" % (colour, char)
+                line += "\n"
+            self._images.append(line)
 
 
 class SpeechBubble(StaticRenderer):
@@ -332,7 +511,7 @@ class SpeechBubble(StaticRenderer):
             bubble += "\n"
             bubble += (" " * max_len) + "\\(  \n"
             bubble += (" " * max_len) + " `\"-\n"
-        self._images = [""]
+        self._images = [bubble]
 
 
 class Box(StaticRenderer):
@@ -359,7 +538,7 @@ class Box(StaticRenderer):
             for _ in range(height - 2):
                 box += "|" + " " * (width - 2) + "|\n"
             box += "+" + "-" * (width - 2) + "+\n"
-        self._images = [""]
+        self._images = [box]
 
 
 class Rainbow(StaticRenderer):
@@ -458,6 +637,9 @@ class BarChart(DynamicRenderer):
         self._keys = keys
 
     def _render_now(self):
+        # Clear the canvas
+        self._clear()
+
         # Dimensions for the chart.
         int_h = self._canvas.height
         int_w = self._canvas.width
@@ -762,6 +944,9 @@ class Plasma(DynamicRenderer):
         self._t = 0
 
     def _render_now(self):
+        # Clear the canvas
+        self._clear()
+
         # Internal function for creating a sine wave radiating out from a point
         def f(x1, y1, xp, yp, n):
             return sin(sqrt((x1 - self._canvas.width * xp) ** 2 +
@@ -795,7 +980,61 @@ class RotatedDuplicate(StaticRenderer):
         :param renderer: The renderer to wrap.
         """
         super(RotatedDuplicate, self).__init__()
-        self._images = [""]
+
+        # Process each image from the wrapped renderer
+        self._images = []
+        for image in renderer.images:
+            # Create the rotated duplicate
+            lines = []
+            for line in image:
+                lines.append(line)
+
+            # Add reversed/rotated version underneath
+            for line in reversed(image):
+                lines.append(line[::-1])
+
+            # Calculate actual dimensions and cropping
+            total_height = len(lines)
+            total_width = max(len(line) for line in lines) if lines else 0
+
+            # Vertical centering/cropping
+            if total_height > height:
+                # Need to crop - take from the middle
+                start_y = (total_height - height) // 2
+                lines = lines[start_y:start_y + height]
+
+            # Build the final image with proper dimensions
+            result = []
+            v_pad = (height - len(lines)) // 2 if height > len(lines) else 0
+
+            # Add top padding
+            for _ in range(v_pad):
+                result.append(" " * width)
+
+            # Add the content lines
+            for line in lines:
+                if total_width > width:
+                    # Need to crop horizontally - take from the middle
+                    start_x = (len(line) - width) // 2 if len(line) > width else 0
+                    cropped_line = line[start_x:start_x + width]
+                else:
+                    # Center horizontally
+                    h_pad = (width - len(line)) // 2
+                    cropped_line = " " * h_pad + line + " " * (width - h_pad - len(line))
+
+                # Ensure the line is exactly the right width
+                if len(cropped_line) < width:
+                    cropped_line += " " * (width - len(cropped_line))
+                elif len(cropped_line) > width:
+                    cropped_line = cropped_line[:width]
+
+                result.append(cropped_line)
+
+            # Add bottom padding
+            while len(result) < height:
+                result.append(" " * width)
+
+            self._images.append("\n".join(result))
 
 
 class Kaleidoscope(DynamicRenderer):
@@ -830,6 +1069,9 @@ class Kaleidoscope(DynamicRenderer):
         self._cell = cell
 
     def _render_now(self):
+        # Clear the canvas
+        self._clear()
+
         # Rotate a point (x, y) through an angle theta.
         def _rotate(x, y, theta):
             return x * cos(theta) - y * sin(theta), x * sin(theta) + y * cos(theta)
@@ -868,12 +1110,18 @@ class Kaleidoscope(DynamicRenderer):
                 x2 = int(x1 + self._cell.max_width / 2)
                 y2 = int(y1 + self._cell.max_height / 2)
                 if (0 <= y2 < len(text)) and (0 <= x2 < len(text[y2])):
+                    # Check colour_map bounds and handle None values
+                    color = None
+                    if colour_map is not None and 0 <= y2 < len(colour_map) and colour_map[y2] is not None and 0 <= x2 < len(colour_map[y2]):
+                        color = colour_map[y2][x2]
+                    if not color:
+                        color = (Screen.COLOUR_WHITE, 0, Screen.COLOUR_BLACK)
                     self._write(text[y2][x2] + text[y2][x2],
                                 dx * 2,
                                 dy,
-                                colour_map[y2][x2][0],
-                                colour_map[y2][x2][1],
-                                colour_map[y2][x2][2])
+                                color[0],
+                                color[1],
+                                color[2])
 
         # Now rotate the background cell for the next frame.
         self._rotation += pi / 180
@@ -1024,6 +1272,11 @@ class AnsiArtPlayer(AbstractScreenPlayer):
         self._strip = strip
         self._rate = rate
         self._encoding = encoding
+        self._line_count = 0
+        self._all_data = self._file.read()
+        self._file.close()
+        self._file = None
+        self._position = 0
 
     def __enter__(self):
         return self
@@ -1033,7 +1286,29 @@ class AnsiArtPlayer(AbstractScreenPlayer):
             self._file.close()
 
     def _render_now(self):
-        return [], []
+        # Process content incrementally based on rate (number of lines)
+        if self._position < len(self._all_data):
+            # Find the next chunk to process based on line count
+            chunk_end = self._position
+            lines_found = 0
+            while chunk_end < len(self._all_data) and lines_found < self._rate:
+                if self._all_data[chunk_end:chunk_end+1] == b'\n':
+                    lines_found += 1
+                chunk_end += 1
+
+            # Get the chunk and decode it
+            chunk = self._all_data[self._position:chunk_end]
+            text = chunk.decode(self._encoding, errors='replace')
+
+            # Strip CRLF if requested
+            if self._strip:
+                text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+            # Process the content
+            self._play_content(text)
+            self._position = chunk_end
+
+        return self._plain_image, self._colour_map
 
 
 class AsciinemaPlayer(AbstractScreenPlayer):
@@ -1093,4 +1368,4 @@ class AsciinemaPlayer(AbstractScreenPlayer):
                     # Python 3 raises a subclass of this error, so will also be caught.
                     break
 
-        return [], []
+        return self._plain_image, self._colour_map
