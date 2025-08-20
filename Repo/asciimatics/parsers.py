@@ -376,7 +376,8 @@ class AnsiTerminalParser(Parser):
                         yield result
             else:
                 logger.debug("Ignoring character: %d", char)
-                yield (self._state.last_offset, Parser.DISPLAY_TEXT, "X")
+                # For non-printable control characters, display a space
+                yield (self._state.last_offset, Parser.DISPLAY_TEXT, " ")
                 self._state.last_offset = self._state.offset + 1
             self._state.offset += new_offset
             self._state.text = self._state.text[new_offset:]

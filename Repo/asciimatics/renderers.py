@@ -76,7 +76,17 @@ class Renderer(with_metaclass(ABCMeta, object)):
         """
         :returns: a plain string representation of the next rendered image.
         """
-        return ""
+        return str(self)
+
+    def __str__(self):
+        """
+        :returns: a plain string representation of the next rendered image.
+        """
+        result = self.rendered_text
+        if result is None or not isinstance(result, tuple):
+            return ""
+        text, _ = result
+        return "\n".join(text) if text else ""
 
 
 class StaticRenderer(Renderer):
@@ -108,6 +118,7 @@ class StaticRenderer(Renderer):
         self._animation = animation
         self._colour_map = None
         self._plain_images = []
+        self._convert_images()
 
     def _convert_images(self):
         """
@@ -115,34 +126,108 @@ class StaticRenderer(Renderer):
         """
         self._plain_images = []
         self._colour_map = []
-        return
+
+        for image in self._images:
+            lines = image.split("\n")
+            plain_image = []
+            colour_map = []
+
+            for line in lines:
+                plain_line = ""
+                colour_line = []
+
+                # Current colors for this line
+                current_fg = Screen.COLOUR_WHITE
+                current_attr = 0
+                current_bg = None
+
+                # Parse colour codes in the line
+                while line:
+                    match = self._colour_sequence.match(line)
+                    if match:
+                        # Process colour code based on which pattern matched
+                        groups = match.groups()
+                        if groups[1] is not None:  # 3-parameter version: fg,attr,bg
+                            current_fg = int(groups[1])
+                            if groups[2] is not None:
+                                # ATTRIBUTES is a module-level constant
+                                if groups[2] in ATTRIBUTES:
+                                    current_attr = ATTRIBUTES[groups[2]]
+                                else:
+                                    current_attr = int(groups[2])
+                            if groups[3] is not None:
+                                current_bg = int(groups[3])
+                        elif groups[4] is not None:  # 2-parameter version: fg,attr
+                            current_fg = int(groups[4])
+                            if groups[5] is not None:
+                                if groups[5] in ATTRIBUTES:
+                                    current_attr = ATTRIBUTES[groups[5]]
+                                else:
+                                    current_attr = int(groups[5])
+                        elif groups[6] is not None:  # 1-parameter version: fg
+                            current_fg = int(groups[6])
+                        # The remaining text is the last group
+                        line = groups[-1]
+                    else:
+                        # Regular character
+                        plain_line += line[0]
+                        colour_line.append((current_fg, current_attr, current_bg))
+                        line = line[1:]
+
+                plain_image.append(plain_line)
+                colour_map.append(colour_line)
+
+                # Update max dimensions
+                line_width = wcswidth(plain_line)
+                if line_width is None:
+                    line_width = len(plain_line)
+                self._max_width = max(self._max_width, line_width)
+
+            self._max_height = max(self._max_height, len(lines))
+            self._plain_images.append(plain_image)
+            self._colour_map.append(colour_map)
 
     @property
     def images(self):
         """
         :return: An iterator of all the images in the Renderer.
         """
-        return iter([])
+        return iter(self._plain_images)
 
     @property
     def rendered_text(self):
         """
         :return: The next image and colour map in the sequence as a tuple.
         """
+        if not self._plain_images:
+            return [], []
+
+        # Get the current image based on animation or cycling
+        if self._animation:
+            index = self._animation()
+            if index is not None:
+                index = index % len(self._plain_images)
+            else:
+                index = self._index
+        else:
+            index = self._index
+            self._index = (self._index + 1) % len(self._plain_images)
+
+        return self._plain_images[index], self._colour_map[index]
 
     @property
     def max_height(self):
         """
         :return: The max height of the rendered text (across all images if an animated renderer).
         """
-        return 0
+        return self._max_height
 
     @property
     def max_width(self):
         """
         :return: The max width of the rendered text (across all images if an animated renderer).
         """
-        return 0
+        return self._max_width
 
 
 class DynamicRenderer(with_metaclass(ABCMeta, Renderer)):
@@ -208,15 +293,29 @@ class DynamicRenderer(with_metaclass(ABCMeta, Renderer)):
 
     @property
     def rendered_text(self):
-        return ([], [])
+        if self._must_clear:
+            self._clear()
+        text, colours = self._render_now()
+        if text == [] and colours == []:
+            # If render_now returns empty, use canvas content
+            text = self._canvas.plain_image
+            colours = self._canvas.colour_map
+        return text, colours
 
     @property
     def max_height(self):
-        return 0
+        return self._canvas.height
 
     @property
     def max_width(self):
-        return 0
+        return self._canvas.width
+
+    def __str__(self):
+        """
+        :returns: a plain string representation of the current rendered image.
+        """
+        text, _ = self.rendered_text
+        return "\n".join(text) if text else ""
 
 
 class FigletText(StaticRenderer):
@@ -231,8 +330,8 @@ class FigletText(StaticRenderer):
         :param font: The Figlet font to use (optional).
         :param width: The maximum width for this text in characters.
         """
-        super(FigletText, self).__init__()
-        self._images = [""]
+        figlet = Figlet(font=font, width=width)
+        super(FigletText, self).__init__(images=[figlet.renderText(text)])
 
 
 class _ImageSequence(object):
@@ -267,8 +366,32 @@ class ImageFile(StaticRenderer):
         :param height: The height of the text rendered image.
         :param colours: The number of colours the terminal supports.
         """
-        super(ImageFile, self).__init__()
-        self._images = [""]
+        # Load and process the image
+        img = Image.open(filename)
+
+        # Handle animated images (like GIFs)
+        images = []
+        for frame in _ImageSequence(img):
+            # Convert to greyscale
+            frame = frame.convert('L')
+
+            # Calculate dimensions maintaining aspect ratio
+            width = int(frame.size[0] * height * 2.0 / frame.size[1])
+            frame = frame.resize((width, height), Image.LANCZOS)
+
+            # Convert to ASCII
+            pixels = frame.load()
+            text_image = ""
+            for y in range(height):
+                line = ""
+                for x in range(width):
+                    pixel = pixels[x, y]
+                    index = int(pixel * (len(self._greyscale) - 1) / 255)
+                    line += self._greyscale[index]
+                text_image += line + "\n" if y < height - 1 else line
+            images.append(text_image)
+
+        super(ImageFile, self).__init__(images=images)
 
 
 class ColourImageFile(StaticRenderer):
@@ -295,8 +418,51 @@ class ColourImageFile(StaticRenderer):
         :param uni: Whether to use unicode box characters or not.
         :param dither: Whether to dither the rendered image or not.
         """
-        super(ColourImageFile, self).__init__()
-        self._images = [""]
+        # Load and process the image
+        img = Image.open(filename)
+
+        # Handle animated images
+        images = []
+        for frame in _ImageSequence(img):
+            # Convert to RGB
+            frame = frame.convert('RGB')
+
+            # Calculate dimensions maintaining aspect ratio
+            width = int(frame.size[0] * height * 2.0 / frame.size[1])
+            frame = frame.resize((width, height), Image.LANCZOS)
+
+            # Convert to coloured text using unicode block characters
+            pixels = frame.load()
+            text_image = ""
+            for y in range(height):
+                line = ""
+                for x in range(width):
+                    r, g, b = pixels[x, y]
+                    # Map RGB to terminal colour
+                    if screen.colours >= 256:
+                        # Use 256 colour mode - map RGB to xterm-256 palette
+                        colour = 16 + (r * 5 // 255) * 36 + (g * 5 // 255) * 6 + (b * 5 // 255)
+                    else:
+                        # Use basic 16 colours
+                        colour = 0
+                        if r > 128:
+                            colour |= 1
+                        if g > 128:
+                            colour |= 2
+                        if b > 128:
+                            colour |= 4
+
+                    # Use unicode block character or space
+                    char = u"█" if uni else " "
+                    if fill_background:
+                        line += "${%d,%d,%d}%s" % (colour, 0, colour, char)
+                    else:
+                        line += "${%d,0,%d}%s" % (colour, bg, char)
+
+                text_image += line + "\n" if y < height - 1 else line
+            images.append(text_image)
+
+        super(ColourImageFile, self).__init__(images=images)
 
 
 class SpeechBubble(StaticRenderer):
@@ -310,8 +476,7 @@ class SpeechBubble(StaticRenderer):
         :param tail: Where to put the bubble callout tail, specifying "L" or
                      "R" for left or right tails.  Can be None for no tail.
         """
-        super(SpeechBubble, self).__init__()
-        max_len = max([wcswidth(x) for x in text.split("\n")])
+        max_len = max([wcswidth(x) if wcswidth(x) else len(x) for x in text.split("\n")])
         if uni:
             bubble = "╭─" + "─" * max_len + "─╮\n"
             for line in text.split("\n"):
@@ -332,7 +497,7 @@ class SpeechBubble(StaticRenderer):
             bubble += "\n"
             bubble += (" " * max_len) + "\\(  \n"
             bubble += (" " * max_len) + " `\"-\n"
-        self._images = [""]
+        super(SpeechBubble, self).__init__(images=[bubble])
 
 
 class Box(StaticRenderer):
@@ -348,7 +513,6 @@ class Box(StaticRenderer):
         :param height: The desired height of the box.
         :param uni: Whether to use unicode box characters or not.
         """
-        super(Box, self).__init__()
         if uni:
             box = u"┌" + u"─" * (width - 2) + u"┐\n"
             for _ in range(height - 2):
@@ -359,7 +523,7 @@ class Box(StaticRenderer):
             for _ in range(height - 2):
                 box += "|" + " " * (width - 2) + "|\n"
             box += "+" + "-" * (width - 2) + "+\n"
-        self._images = [""]
+        super(Box, self).__init__(images=[box])
 
 
 class Rainbow(StaticRenderer):
@@ -795,7 +959,79 @@ class RotatedDuplicate(StaticRenderer):
         :param renderer: The renderer to wrap.
         """
         super(RotatedDuplicate, self).__init__()
-        self._images = [""]
+
+        # Get the original images from the wrapped renderer
+        original_images = list(renderer.images)
+        rotated_images = []
+
+        for original in original_images:
+            # Create a new image with both original and rotated versions
+            lines = []
+
+            # Calculate centering offsets
+            orig_height = len(original)
+            orig_width = max(len(line) for line in original) if original else 0
+            total_height = orig_height * 2  # Original + rotated
+
+            # Center vertically
+            v_offset = (height - total_height) // 2
+
+            # If content is taller than available height, we need to crop
+            if v_offset < 0:
+                # Skip lines from the top
+                skip_top = -v_offset
+            else:
+                skip_top = 0
+                # Add top padding
+                for _ in range(v_offset):
+                    lines.append(" " * width)
+
+            # Add original image (centered horizontally)
+            h_offset = (width - orig_width) // 2
+            lines_added = 0
+
+            # Add original lines (skip if needed)
+            for i, line in enumerate(original):
+                if i < skip_top:
+                    continue
+                if len(lines) >= height:
+                    break
+
+                if h_offset >= 0:
+                    # Padding case - center the line
+                    padded_line = " " * h_offset + line + " " * (width - h_offset - len(line))
+                    lines.append(padded_line[:width])
+                else:
+                    # Clipping case - take from the center of the line
+                    start = (-h_offset)
+                    lines.append(line[start:start + width] if start < len(line) else "")
+
+            # Add rotated image (180 degrees - upside down and reversed)
+            reversed_original = list(reversed(original))
+            for i, line in enumerate(reversed_original):
+                if i + len(original) < skip_top:
+                    continue
+                if len(lines) >= height:
+                    break
+
+                reversed_line = line[::-1]  # Reverse the line
+                if h_offset >= 0:
+                    # Padding case - center the line
+                    padded_line = " " * h_offset + reversed_line + " " * (width - h_offset - len(reversed_line))
+                    lines.append(padded_line[:width])
+                else:
+                    # Clipping case - take from the center of the line
+                    start = (-h_offset)
+                    lines.append(reversed_line[start:start + width] if start < len(reversed_line) else "")
+
+            # Add bottom padding
+            while len(lines) < height:
+                lines.append(" " * width)
+
+            # Join and limit to requested height
+            rotated_images.append("\n".join(lines[:height]))
+
+        super(RotatedDuplicate, self).__init__(images=rotated_images)
 
 
 class Kaleidoscope(DynamicRenderer):
@@ -1033,6 +1269,26 @@ class AnsiArtPlayer(AbstractScreenPlayer):
             self._file.close()
 
     def _render_now(self):
+        # Read and process the file progressively
+        for _ in range(self._rate):
+            line = self._file.readline()
+            if not line:
+                break
+
+            # Decode the line with the specified encoding
+            if isinstance(line, bytes):
+                line = line.decode(self._encoding, errors='replace')
+
+            # Strip CRLF if requested
+            if self._strip and line.endswith('\r\n'):
+                line = line[:-2]
+            elif self._strip and line.endswith('\n'):
+                line = line[:-1]
+
+            # Play the content through the parser
+            self._play_content(line)
+
+        # Return empty lists to indicate we're using the canvas directly
         return [], []
 
 
